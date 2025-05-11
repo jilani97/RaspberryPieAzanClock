@@ -30,30 +30,31 @@ for name, time in prayer_times.items():
 print(tabulate.tabulate(table, headers='firstrow'))
 while True:
     # every 5 seconds print how many hours and minutes until the next prayer with name and time
-    time_until_next_prayer = (time - dt.datetime.now(eastern) for time in prayer_times.values())
-    print({time_until_next_prayer})
-    hours, remainder = divmod(time_until_next_prayer, 3600)
+    now = dt.datetime.now(eastern)
+    next_prayers=[time for time in prayer_times.values() if time > now]
+    if len(next_prayers)==0:
+        print("The next prayer is tomorrow!")
+        date = dt.datetime.today() + dt.timedelta(days=1) # add a day to the date
+        prayer_times = pt.calc_times(date, eastern, longitude, latitude)
+        next_prayers=[time for time in prayer_times.values() if time > now]
+    time_until_next_prayer = min(next_prayers, key=lambda x: abs(x - now))
+    next = time_until_next_prayer - now
+    print(next)
+    hours, remainder = divmod(next.seconds, 3600)
     minutes, _ = divmod(remainder, 60)
     print(f"{hours} hours and {minutes} minutes until the next prayer")
-    t.sleep(3)
+    t.sleep(5)
     # get the name of the next prayer
     next_prayer = [name for name, time in prayer_times.items() if name == min(prayer_times, key=lambda x: abs(prayer_times[x] - dt.datetime.now(eastern)))][0]
-    convert = t.strftime("%I:%M", t.gmtime(time_until_next_prayer.seconds))
-    print(f"The next prayer is {next_prayer} in {convert} hours and minutes, or {time_until_next_prayer.seconds} seconds")
+    print(f"The next prayer is {next_prayer}, in {next.seconds} seconds")
     # if the next prayer is less than 5 seconds away, dont check date only time, print a message
-    if time_until_next_prayer.seconds < 5:
-        print("The next prayer is now!", time_until_next_prayer.seconds)
+    if next.seconds < 5:
+        print("The next prayer is now!", next.seconds)
         if next_prayer == "fajr":
             os.system("mpg123 " + "fajrAzan.mp3")
             print("Playing Fajr Azan...")
         elif next_prayer == "sunrise":
             print("Fajr time is now over as it is sunrise")
         else:
-            os.system("mpg123 " + "AzanNotFajr.mp3")
+            os.system("mpg123 " + "Recording.mp3")
             print("Playing Azan...")
-
-    # if the next prayer is tomorrow, print a message
-    if time_until_next_prayer.days > 0:
-        print("The next prayer is tomorrow!")
-        date = dt.datetime.today() + dt.timedelta(days=1) # add a day to the date
-        prayer_times = pt.calc_times(date, eastern, longitude, latitude)
