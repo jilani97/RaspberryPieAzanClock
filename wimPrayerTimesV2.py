@@ -23,7 +23,7 @@ IMMINENT_WINDOW_SECONDS = int(os.getenv("PRAYER_IMMINENT_WINDOW_SECONDS", "30"))
 TRIGGER_WINDOW_SECONDS = int(os.getenv("PRAYER_TRIGGER_WINDOW_SECONDS", "5"))
 AZAN_ASYNC_PLAYBACK = os.getenv("AZAN_ASYNC_PLAYBACK", "0") == "1"
 FAJR_AZAN_FILE = BASE_DIR / "fajrAzan.mp3"
-GENERIC_AZAN_FILE = BASE_DIR / "AzanNotFajr_Safe.mp3"
+GENERIC_AZAN_FILE = BASE_DIR / "Recording.mp3"
 EXPECTED_API_FIELDS = {
     "Fajr": "fajr",
     "Zuhr": "duhr",
