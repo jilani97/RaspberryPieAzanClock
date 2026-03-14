@@ -21,7 +21,7 @@ POLL_SECONDS = int(os.getenv("PRAYER_POLL_SECONDS", "30"))
 FETCH_RETRY_SECONDS = int(os.getenv("PRAYER_FETCH_RETRY_SECONDS", "300"))
 IMMINENT_WINDOW_SECONDS = int(os.getenv("PRAYER_IMMINENT_WINDOW_SECONDS", "30"))
 TRIGGER_WINDOW_SECONDS = int(os.getenv("PRAYER_TRIGGER_WINDOW_SECONDS", "5"))
-MPG123_BUFFER = os.getenv("MPG123_BUFFER", "8192")
+AZAN_ASYNC_PLAYBACK = os.getenv("AZAN_ASYNC_PLAYBACK", "0") == "1"
 FAJR_AZAN_FILE = BASE_DIR / "fajrAzan.mp3"
 GENERIC_AZAN_FILE = BASE_DIR / "AzanNotFajr_Safe.mp3"
 EXPECTED_API_FIELDS = {
@@ -140,12 +140,32 @@ def play_azan(prayer_name: str) -> bool:
         return False
 
     logging.info("Playing %s Azan using %s", prayer_name, azan_file.name)
+    command = [mpg123_path, str(azan_file)]
     try:
-        subprocess.Popen(
-            [mpg123_path, "--buffer", MPG123_BUFFER, "-q", str(azan_file)],
+        if AZAN_ASYNC_PLAYBACK:
+            subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            return True
+
+        completed_process = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            check=False,
         )
+        if completed_process.returncode != 0:
+            logging.error(
+                "mpg123 exited with status %s while playing %s.",
+                completed_process.returncode,
+                azan_file.name,
+            )
+            return False
     except OSError as error:
         logging.error("Failed to start mpg123: %s", error)
         return False
