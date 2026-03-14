@@ -1,0 +1,20 @@
+[Unit]
+Description=Azan Clock
+Wants=network-online.target sound.target
+After=network-online.target sound.target
+
+[Service]
+Type=simple
+User=dietpi
+WorkingDirectory=/opt/azan-clock
+Environment=PYTHONUNBUFFERED=1
+Environment=PRAYER_LOCATION_ID=122
+Environment=PRAYER_POLL_SECONDS=30
+ExecStart=/usr/bin/python3 /opt/azan-clock/wimPrayerTimesV2.py
+Restart=always
+RestartSec=15
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

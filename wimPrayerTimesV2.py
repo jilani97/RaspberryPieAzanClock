@@ -1,186 +1,258 @@
-import requests
-from datetime import date, datetime as dt, timedelta, time as t
-import time as sleepyTime
-import tabulate
+import logging
 import os
-from typing import Dict, Any
+import shutil
+import subprocess
+import sys
+import time as sleepy_time
+from datetime import date, datetime as dt, timedelta, time as time_of_day
+from pathlib import Path
+from typing import Dict, Optional, Tuple
 
-# --- Configuration ---
-# ID for Oslo from bonnetid.no
-OSLO_ID = 122
-API_TOKEN = "750e83c3-4cc2-4e68-a3ac-add5b747d636"
+import requests
+import tabulate
+
+
+BASE_DIR = Path(__file__).resolve().parent
+LOCATION_ID = int(os.getenv("PRAYER_LOCATION_ID", "122"))
+API_TOKEN = os.getenv("BONNETID_API_TOKEN", "750e83c3-4cc2-4e68-a3ac-add5b747d636")
 API_URL_TEMPLATE = "https://api.bonnetid.no/prayertimes/{location_id}/{year}/{month}/{day}/"
-SLEEP_SECONDS = 30 
-FAJR_AZAN_FILE = "fajrAzan.mp3"
-GENERIC_AZAN_FILE = "AzanNotFajr_Safe.mp3" # <-- Updated Filename
+REQUEST_TIMEOUT_SECONDS = int(os.getenv("PRAYER_REQUEST_TIMEOUT", "10"))
+POLL_SECONDS = int(os.getenv("PRAYER_POLL_SECONDS", "30"))
+FETCH_RETRY_SECONDS = int(os.getenv("PRAYER_FETCH_RETRY_SECONDS", "300"))
+IMMINENT_WINDOW_SECONDS = int(os.getenv("PRAYER_IMMINENT_WINDOW_SECONDS", "30"))
+TRIGGER_WINDOW_SECONDS = int(os.getenv("PRAYER_TRIGGER_WINDOW_SECONDS", "5"))
+MPG123_BUFFER = os.getenv("MPG123_BUFFER", "8192")
+FAJR_AZAN_FILE = BASE_DIR / "fajrAzan.mp3"
+GENERIC_AZAN_FILE = BASE_DIR / "AzanNotFajr_Safe.mp3"
+EXPECTED_API_FIELDS = {
+    "Fajr": "fajr",
+    "Zuhr": "duhr",
+    "Asr": "asr_2x_shadow",
+    "Maghrib": "maghrib",
+    "Isha": "isha",
+}
 
-# Global state for prayer times and the current date we fetched
-current_prayer_times: Dict[str, str] = {}
-current_date: date = date.today()
 
-# --- Utility Functions ---
+def configure_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
-def fetch_prayer_times() -> bool:
-    """
-    Fetches prayer times for the current_date from the API and updates
-    the current_prayer_times global dictionary.
-    """
-    global current_prayer_times, current_date
 
-    year = current_date.year
-    month = current_date.month
-    day = current_date.day
+def fetch_prayer_times(session: requests.Session, target_date: date) -> Dict[str, str]:
+    url = API_URL_TEMPLATE.format(
+        location_id=LOCATION_ID,
+        year=target_date.year,
+        month=target_date.month,
+        day=target_date.day,
+    )
+    headers = {"Accept": "application/json", "Api-Token": API_TOKEN}
 
-    url = API_URL_TEMPLATE.format(location_id=OSLO_ID, year=year, month=month, day=day)
-    headers = {'Accept': 'application/json', 'Api-Token': API_TOKEN}
+    logging.info("Fetching prayer times for %s", target_date.isoformat())
+    response = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+    response.raise_for_status()
+    data = response.json()
 
-    print(f"\n🕋 Fetching prayer times for: {current_date}")
+    missing_keys = [api_key for api_key in EXPECTED_API_FIELDS.values() if api_key not in data]
+    if missing_keys:
+        raise ValueError(f"Missing expected API fields: {', '.join(missing_keys)}")
 
+    return {
+        prayer_name: str(data[api_key])
+        for prayer_name, api_key in EXPECTED_API_FIELDS.items()
+    }
+
+
+def load_prayer_times_with_retry(session: requests.Session, target_date: date) -> Dict[str, str]:
+    while True:
+        try:
+            return fetch_prayer_times(session, target_date)
+        except requests.RequestException as error:
+            logging.warning(
+                "Prayer time request failed for %s: %s. Retrying in %s seconds.",
+                target_date.isoformat(),
+                error,
+                FETCH_RETRY_SECONDS,
+            )
+        except ValueError as error:
+            logging.warning(
+                "Prayer time data for %s was invalid: %s. Retrying in %s seconds.",
+                target_date.isoformat(),
+                error,
+                FETCH_RETRY_SECONDS,
+            )
+
+        sleepy_time.sleep(FETCH_RETRY_SECONDS)
+
+
+def get_dt_from_time_str(time_str: str, target_date: date) -> dt:
     try:
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status() 
-        data = response.json()
-
-        if all(key in data for key in ["fajr", "duhr", "asr_2x_shadow", "maghrib", "isha"]):
-            current_prayer_times = {
-                "Fajr": data["fajr"],
-                "Zuhr": data["duhr"], 
-                "Asr": data["asr_2x_shadow"],
-                "Maghrib": data["maghrib"],
-                "Isha": data["isha"]
-            }
-            return True
-        else:
-            print("❌ Error: Missing expected keys in API response data.")
-            return False
-
-    except requests.exceptions.RequestException as e:
-        print(f"❌ Error during API request: {e}")
-        return False
-    except Exception as e:
-        print(f"❌ An unexpected error occurred: {e}")
-        return False
+        parsed_time = dt.strptime(time_str, "%H:%M").time()
+    except ValueError as error:
+        raise ValueError(f"Could not parse prayer time '{time_str}'") from error
+    return dt.combine(target_date, parsed_time)
 
 
-def get_dt_from_time_str(time_str: str, date_obj: date) -> dt:
-    """Combines a 'HH:MM' time string with a date object to create a datetime object."""
-    try:
-        time_obj = dt.strptime(time_str, "%H:%M").time()
-        return dt.combine(date_obj, time_obj)
-    except ValueError:
-        print(f"⚠️ Warning: Could not parse time string '{time_str}'.")
-        return dt.min
-
-
-def display_prayer_times():
-    """Prints the current day's prayer times in a tabulated format."""
-    if not current_prayer_times:
-        print("No prayer times available to display.")
-        return
-
+def display_prayer_times(target_date: date, prayer_times: Dict[str, str]) -> None:
     table = [["Name", "Time"]]
-    for prayer, time in current_prayer_times.items():
-        table.append([prayer, time])
+    for prayer_name, prayer_time in prayer_times.items():
+        table.append([prayer_name, prayer_time])
 
-    print(f"\n🗓️ Prayer Times for {current_date.strftime('%Y-%m-%d')}:")
-    print(tabulate.tabulate(table, headers='firstrow', tablefmt="fancy_grid"))
-    print("-" * 40)
+    print()
+    print(tabulate.tabulate(table, headers="firstrow", tablefmt="fancy_grid"))
+    logging.info("Loaded prayer times for %s", target_date.isoformat())
 
 
-def find_next_prayer(now: dt) -> tuple[str, dt, timedelta]:
-    """
-    Finds the next prayer time after the current moment 'now'.
-    Returns the prayer name, its datetime, and the timedelta until it.
-    """
-    next_prayers_after_now = []
+def find_next_prayer(
+    now: dt, prayer_times: Dict[str, str], target_date: date
+) -> Optional[Tuple[str, dt, timedelta]]:
+    upcoming_prayers = []
 
-    for name, time_str in current_prayer_times.items():
-        prayer_dt = get_dt_from_time_str(time_str, current_date)
+    for prayer_name, prayer_time in prayer_times.items():
+        prayer_dt = get_dt_from_time_str(prayer_time, target_date)
         if prayer_dt > now:
-            next_prayers_after_now.append((name, prayer_dt))
+            upcoming_prayers.append((prayer_name, prayer_dt))
 
-    if not next_prayers_after_now:
-        return "None", dt.min, timedelta.max
+    if not upcoming_prayers:
+        return None
 
-    next_prayer_name, next_prayer_dt = min(next_prayers_after_now, key=lambda x: x[1])
-    time_until = next_prayer_dt - now
-
-    return next_prayer_name, next_prayer_dt, time_until
+    next_prayer_name, next_prayer_dt = min(upcoming_prayers, key=lambda item: item[1])
+    return next_prayer_name, next_prayer_dt, next_prayer_dt - now
 
 
-def play_azan(prayer_name: str):
-    """
-    Plays the Azan using the external 'mpg123' command via os.system.
-    Requires 'mpg123' to be installed on the system (e.g., DietPi).
-    """
+def get_azan_file(prayer_name: str) -> Path:
     if prayer_name == "Fajr":
-        file_path = FAJR_AZAN_FILE
-    else:
-        file_path = GENERIC_AZAN_FILE # <-- Uses the new filename
-        
-    print(f"📢 Playing Azan for {prayer_name} via mpg123: {file_path}...")
+        return FAJR_AZAN_FILE
+    return GENERIC_AZAN_FILE
+
+
+def play_azan(prayer_name: str) -> bool:
+    mpg123_path = shutil.which("mpg123")
+    if not mpg123_path:
+        logging.error("mpg123 is not installed or not in PATH. Cannot play Azan.")
+        return False
+
+    azan_file = get_azan_file(prayer_name)
+    if not azan_file.is_file():
+        logging.error("Audio file not found for %s: %s", prayer_name, azan_file)
+        return False
+
+    logging.info("Playing %s Azan using %s", prayer_name, azan_file.name)
     try:
-        # We run the command and pipe the output to /dev/null to keep the console clean
-        # The '&' runs it in the background, preventing the script from blocking.
-        os.system(f"mpg123 --buffer 8192 -q '{file_path}' &") 
-    except Exception as e:
-        print(f"❌ Could not execute mpg123 command. Error: {e}")
+        subprocess.Popen(
+            [mpg123_path, "--buffer", MPG123_BUFFER, "-q", str(azan_file)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as error:
+        logging.error("Failed to start mpg123: %s", error)
+        return False
 
-# --- Main Logic ---
+    return True
 
-# 1. Initial Fetch
-if fetch_prayer_times():
-    display_prayer_times()
-else:
-    print("🔴 FATAL: Could not retrieve initial prayer times. Exiting.")
-    exit()
 
-# 2. Main Loop
-while True:
-    now = dt.now()
+def validate_runtime_environment() -> None:
+    if not shutil.which("mpg123"):
+        logging.warning("mpg123 is not available in PATH. Audio playback will fail until it is installed.")
 
-    next_prayer_name, next_prayer_dt, time_until = find_next_prayer(now)
+    for audio_file in (FAJR_AZAN_FILE, GENERIC_AZAN_FILE):
+        if not audio_file.is_file():
+            logging.warning("Audio file is missing: %s", audio_file)
 
-    # --- Handling Day Transition ---
-    if next_prayer_name == "None":
-        if now.date() > current_date:
-            print("\n✨ All prayers for today are complete. Fetching tomorrow's times.")
-            current_date = now.date()
-            if not fetch_prayer_times():
-                print("⚠️ Warning: Failed to fetch tomorrow's times. Trying again in 5 minutes.")
-                sleepyTime.sleep(300) 
-                continue
-            display_prayer_times()
-            next_prayer_name, next_prayer_dt, time_until = find_next_prayer(now)
-        else:
-            tomorrow = dt.combine(current_date + timedelta(days=1), t(0, 0))
-            time_until_midnight = tomorrow - now
-            print(f"\n💤 Waiting for midnight to fetch tomorrow's times in {time_until_midnight.total_seconds():.0f} seconds.")
-            sleepyTime.sleep(min(time_until_midnight.total_seconds(), 300)) 
+
+def seconds_until_midnight(now: dt) -> float:
+    tomorrow = dt.combine(now.date() + timedelta(days=1), time_of_day(0, 0))
+    return max(1.0, (tomorrow - now).total_seconds())
+
+
+def run() -> int:
+    session = requests.Session()
+    validate_runtime_environment()
+    loaded_date = date.today()
+    prayer_times = load_prayer_times_with_retry(session, loaded_date)
+    display_prayer_times(loaded_date, prayer_times)
+    last_azan_attempt: Optional[Tuple[date, str]] = None
+    last_imminent_prayer: Optional[Tuple[date, str]] = None
+    idle_logged_for_date: Optional[date] = None
+
+    while True:
+        now = dt.now()
+
+        if now.date() != loaded_date:
+            loaded_date = now.date()
+            prayer_times = load_prayer_times_with_retry(session, loaded_date)
+            display_prayer_times(loaded_date, prayer_times)
+            last_azan_attempt = None
+            last_imminent_prayer = None
+            idle_logged_for_date = None
+
+        next_prayer = find_next_prayer(now, prayer_times, loaded_date)
+        if next_prayer is None:
+            sleep_seconds = min(seconds_until_midnight(now), float(POLL_SECONDS))
+            if idle_logged_for_date != loaded_date:
+                logging.info(
+                    "All prayers for %s are complete. Waiting %.0f seconds for the next refresh.",
+                    loaded_date.isoformat(),
+                    sleep_seconds,
+                )
+                idle_logged_for_date = loaded_date
+            sleepy_time.sleep(sleep_seconds)
             continue
 
-    # --- Time Calculation and Display ---
-    
-    if time_until.total_seconds() < 0:
-        time_to_sleep = SLEEP_SECONDS
-    else:
-        total_seconds = time_until.total_seconds()
-        hours = int(total_seconds // 3600)
-        minutes = int((total_seconds % 3600) // 60)
-        seconds = int(total_seconds % 60)
+        idle_logged_for_date = None
 
-        time_to_sleep = min(total_seconds - 2, SLEEP_SECONDS)
-        time_to_sleep = max(1, time_to_sleep) 
+        next_prayer_name, next_prayer_dt, time_until = next_prayer
+        total_seconds = int(time_until.total_seconds())
+        hours, remainder = divmod(max(total_seconds, 0), 3600)
+        minutes, seconds = divmod(remainder, 60)
 
-        # Continuous countdown display
-        print(f"\r🕐 Current Time: {now.strftime('%H:%M:%S')} | Next Prayer: **{next_prayer_name}** at {next_prayer_dt.strftime('%H:%M')}. Time until: **{hours}h {minutes}m {seconds}s**", end="")
+        status_line = (
+            f"\rCurrent Time: {now.strftime('%H:%M:%S')} | "
+            f"Next Prayer: {next_prayer_name} at {next_prayer_dt.strftime('%H:%M')} | "
+            f"Time until: {hours}h {minutes}m {seconds}s"
+        )
+        print(status_line, end="", flush=True)
 
-        # --- Azan Trigger ---
-        if total_seconds < 30 and total_seconds > 0:
-            print(f"\n🚨 Prayer is IMMINENT! ({int(total_seconds)} seconds remaining)")
-        
-        if total_seconds < 5 and total_seconds > -SLEEP_SECONDS:
+        prayer_key = (loaded_date, next_prayer_name)
+        if 0 < total_seconds <= IMMINENT_WINDOW_SECONDS and prayer_key != last_imminent_prayer:
+            logging.info(
+                "%s is imminent: %s seconds remaining.",
+                next_prayer_name,
+                total_seconds,
+            )
+            last_imminent_prayer = prayer_key
+
+        if total_seconds > IMMINENT_WINDOW_SECONDS and prayer_key == last_imminent_prayer:
+            last_imminent_prayer = None
+
+        if -POLL_SECONDS < total_seconds <= TRIGGER_WINDOW_SECONDS and prayer_key != last_azan_attempt:
+            print()
             play_azan(next_prayer_name)
+            last_azan_attempt = prayer_key
 
-    # --- Wait ---
-    sleepyTime.sleep(time_to_sleep)
+        if total_seconds <= 1:
+            sleep_seconds = 1.0
+        else:
+            sleep_seconds = min(float(POLL_SECONDS), max(1.0, time_until.total_seconds() - 1.0))
+
+        sleepy_time.sleep(sleep_seconds)
+
+
+def main() -> int:
+    configure_logging()
+
+    try:
+        return run()
+    except KeyboardInterrupt:
+        print()
+        logging.info("Shutdown requested. Exiting cleanly.")
+        return 0
+    except Exception:
+        logging.exception("Fatal error in prayer clock.")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
